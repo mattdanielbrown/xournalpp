@@ -14,6 +14,7 @@
 #include <limits>  // for numeric_limits
 #include <memory>
 #include <sstream>
+#include <unordered_set>
 
 #include <gtk/gtk.h>
 #include <stdint.h>
@@ -62,6 +63,8 @@ extern "C" {
 #include <lauxlib.h>  // for luaL_Reg, luaL_newstate, luaL_requiref
 #include <lua.h>      // for lua_getglobal, lua_getfield, lua_setf...
 #include <lualib.h>   // for luaL_openlibs
+
+#include "undo/PageSizeChangeUndoAction.h"
 }
 
 
@@ -663,10 +666,15 @@ static int applib_layerAction(lua_State* L) {
  * - "grouped": the elements get a single undo-redo-action
  * - "individual" each of the elements get an own undo-redo-action
  * - "none": no undo-redo-action will be inserted
- * if an invalid value is being passed as allowUndoRedoAction this function errors
+ * If an invalid value is being passed as allowUndoRedoAction this function errors.
+ * If there are no elements emits a warning and does not add an UndoAction.
  */
 static int handleUndoRedoActionHelper(lua_State* L, Control* control, const char* allowUndoRedoAction,
                                       const std::vector<Element*>& elements) {
+    if (elements.empty()) {
+        g_warning("No elements, therefore not adding an undo action");
+        return 0;
+    }
     if (strcmp("grouped", allowUndoRedoAction) == 0) {
         PageRef const& page = control->getCurrentPage();
         Layer* layer = page->getSelectedLayer();
@@ -687,6 +695,21 @@ static int handleUndoRedoActionHelper(lua_State* L, Control* control, const char
     return 0;
 }
 
+
+/**
+ * Helper function for API adding elements. Empties the stack and then pushes the pointers
+ * to all elements in the given vector into a table on the stack.
+ */
+static void refsHelper(lua_State* L, std::vector<Element*> elements) {
+    lua_settop(L, 0);
+    lua_newtable(L);
+    size_t count = 0;
+    for (Element* element: elements) {
+        lua_pushinteger(L, ++count);                            // index
+        lua_pushlightuserdata(L, static_cast<void*>(element));  // value
+        lua_settable(L, -3);                                    // insert
+    }
+}
 
 /**
  * Helper function for addStroke API. Parses pen settings from API call, taking
@@ -802,6 +825,7 @@ static void addStrokeHelper(lua_State* L, std::unique_ptr<Stroke> stroke) {
  *
  * @param opts {splines:{coordinates:number[], tool:string, width:number, color:integer, fill:number,
  * linestyle:string}[], allowUndoRedoAction:string}
+ * @return lightuserdata[] references to the created strokes
  *
  * Required Arguments: splines
  * Optional Arguments: pressure, tool, width, color, fill, lineStyle
@@ -817,7 +841,7 @@ static void addStrokeHelper(lua_State* L, std::unique_ptr<Stroke> stroke) {
  * The function checks that the length of the coordinate table is divisible by eight, and will throw
  * an error if it is not.
  *
- * Example: app.addSplines({
+ * Example: local refs = app.addSplines({
  *            ["splines"] = { -- The outer table is a table of strokes
  *                ["coordinates"] = { -- Each inner table is a coord stream that represents SplineSegments that can be
  * assembled into a stroke
@@ -927,7 +951,9 @@ static int applib_addSplines(lua_State* L) {
     allowUndoRedoAction = luaL_optstring(L, -1, "grouped");
     lua_pop(L, 1);
     handleUndoRedoActionHelper(L, ctrl, allowUndoRedoAction, strokes);
-    return 0;
+
+    refsHelper(L, strokes);
+    return 1;
 }
 
 /**
@@ -938,6 +964,7 @@ static int applib_addSplines(lua_State* L) {
  *
  * @param opts {strokes:{X:number[], Y:number[], pressure:number[], tool:string, width:number, color:integer,
  * fill:number, linestyle:string}[], allowUndoRedoAction:string}
+ * @return lightuserdata[] references to the created strokes
  *
  * Required Arguments: X, Y
  * Optional Arguments: pressure, tool, width, color, fill, lineStyle
@@ -951,7 +978,7 @@ static int applib_addSplines(lua_State* L) {
  *
  * Example:
  *
- * app.addStrokes({
+ * local refs = app.addStrokes({
  *     ["strokes"] = { -- The outer table is a table of strokes
  *         {   -- Inside a stroke are three tables of equivalent length that represent a series of points
  *             ["x"]        = { [1] = 110.0, [2] = 120.0, [3] = 130.0, ... },
@@ -1121,7 +1148,8 @@ static int applib_addStrokes(lua_State* L) {
     else {
         return luaL_error(L, "Unrecognized undo/redo option: %s", allowUndoRedoAction);
     }
-    return 0;
+    refsHelper(L, strokes);
+    return 1;
 }
 
 /**
@@ -1134,6 +1162,7 @@ static int applib_addStrokes(lua_State* L) {
  *
  * @param opts {texts:{text:string, font:{name:string, size:number}, color:integer, x:number, y:number}[],
  * allowUndoRedoAction:string}
+ * @return lightuserdata[] references to the created text elements
  *
  * Parameters per textbox:
  *   - text string: content of the textbox (required)
@@ -1144,7 +1173,7 @@ static int applib_addStrokes(lua_State* L) {
  *
  * Example:
  *
- * app.addTexts{texts={
+ * local refs = app.addTexts{texts={
  *   {
  *     text="Hello World",
  *     font={name="Noto Sans Mono Medium", size=8.0},
@@ -1282,7 +1311,8 @@ static int applib_addTexts(lua_State* L) {
     lua_pop(L, 1);
     handleUndoRedoActionHelper(L, control, allowUndoRedoAction, texts);
 
-    return 0;
+    refsHelper(L, texts);
+    return 1;
 }
 
 /**
@@ -1291,7 +1321,7 @@ static int applib_addTexts(lua_State* L) {
  *
  * @param type string "selection" or "layer"
  * @return {text:string, font:{name:string, size:number}, color:integer, x:number, y:number, width:number,
- * height:number}[] texts
+ * height:number, ref:lightuserdata}[] texts
  *
  * Required argument: type ("selection" or "layer")
  *
@@ -1310,6 +1340,7 @@ static int applib_addTexts(lua_State* L) {
  *     y = 70.0,
  *     width = 55.0,
  *     height = 23.0,
+ *     ref = userdata: 0x5f644c0700d0
  *   },
  *   {
  *     text = "Testing",
@@ -1322,6 +1353,7 @@ static int applib_addTexts(lua_State* L) {
  *     y = 70.0,
  *     width = 55.0,
  *     height = 23.0,
+ *     ref = userdata: 0x5f644c0701e8
  *   },
  * }
  *
@@ -1384,6 +1416,9 @@ static int applib_getTexts(lua_State* L) {
             lua_pushnumber(L, t->getElementHeight());
             lua_setfield(L, -2, "height");  // add height to text
 
+            lua_pushlightuserdata(L, static_cast<void*>(t));
+            lua_setfield(L, -2, "ref");
+
             lua_settable(L, -3);  // add text to elements
         }
     }
@@ -1396,7 +1431,7 @@ static int applib_getTexts(lua_State* L) {
  *
  * @param type string "selection" or "layer"
  * @return {x:number[], y:number[], pressure:number[], tool:string, width:number, color:integer, fill:number,
- * linestyle:string}[] strokes
+ * linestyle:string, ref:lightuserdata}[] strokes
  *
  * Required argument: type ("selection" or "layer")
  *
@@ -1415,6 +1450,7 @@ static int applib_getTexts(lua_State* L) {
  *             ["color"] = 0xa000f0,
  *             ["fill"] = 0,
  *             ["lineStyle"] = "plain",
+ *             ["ref"] = userdata: 0x5f644c02c538
  *         },
  *         {
  *             ["x"]         = {207, 207.5, 315.2, 315.29, 207.5844},
@@ -1424,6 +1460,7 @@ static int applib_getTexts(lua_State* L) {
  *             ["color"]     = 16744448,
  *             ["fill"]      = -1,
  *             ["lineStyle"] = "plain",
+ *             ["ref"] = userdata: 0x5f644c02d440
  *         },
  *         {
  *             ["x"]         = {387.60, 387.6042, 500.879, 500.87, 387.604},
@@ -1433,6 +1470,7 @@ static int applib_getTexts(lua_State* L) {
  *             ["color"]     = 16744448,
  *             ["fill"]      = -1,
  *             ["lineStyle"] = "plain",
+ *             ["ref"] = userdata: 0x5f644c0700d0
  *         },
  * }
  */
@@ -1529,6 +1567,9 @@ static int applib_getStrokes(lua_State* L) {
             lua_pushstring(L, StrokeStyle::formatStyle(s->getLineStyle()).c_str());
             lua_setfield(L, -2, "lineStyle");  // add linestyle to stroke
 
+            lua_pushlightuserdata(L, static_cast<void*>(s));
+            lua_setfield(L, -2, "ref");
+
             lua_settable(L, -3);  // add stroke to returned table
         }
     }
@@ -1593,7 +1634,6 @@ static int applib_getColorPalette(lua_State* L) {
     lua_settop(L, 0);
 
     Plugin* plugin = Plugin::getPluginFromLua(L);
-    Settings* settings = plugin->getControl()->getSettings();
     const Palette& palette = plugin->getControl()->getPalette();
 
 
@@ -2368,8 +2408,11 @@ static int applib_setPageSize(lua_State* L) {
 
     if (width > 0 && height > 0) {
         doc->lock();
+        double oldW = page->getWidth();
+        double oldH = page->getHeight();
         Document::setPageSize(page, width, height);
         doc->unlock();
+        control->getUndoRedoHandler()->addUndoAction(std::make_unique<PageSizeChangeUndoAction>(page, oldW, oldH));
     }
 
     size_t pageNo = doc->indexOf(page);
@@ -2684,7 +2727,8 @@ static int applib_openFile(lua_State* L) {
         forceOpen = lua_toboolean(L, 3);
     }
 
-    control->openFile(fs::path(filename), [](bool) {}, scrollToPage - 1, forceOpen);
+    control->openFile(
+            fs::path(filename), [](bool) {}, scrollToPage - 1, forceOpen);
     lua_pushboolean(L, true);  // Todo replace with callback
     return 1;
 }
@@ -2694,6 +2738,7 @@ static int applib_openFile(lua_State* L) {
  *
  * @param opts {images:{path:string, data:string, x:number, y:number, maxHeight:number, maxWidth:number,
  * aspectRatio:boolean}[], allowUndoRedoAction:string}
+ * @return lightuserdata|string[]
  *
  * Global parameters:
  *  - images table: array of image-parameter-tables
@@ -2722,15 +2767,16 @@ static int applib_openFile(lua_State* L) {
  * specified. Still, the scale parameter is applied after this width/height scaling and if after that the dimensions are
  * too large for the page, the image still gets scaled down afterwards.
  *
- * Returns as many values as images were passed. A nil value represents success, while
- * on error the value corresponding to the image will be a string with the error message.
- * If the parameters don't fit at all, a real lua error might be thrown immediately.
+ * Returns a table with as many values as images were passed. A value of type lightuserdata represents the reference to
+ * the image, while on error the value corresponding to the image will be a string with the error message. If the
+ * parameters don't fit at all, a real lua error might be thrown immediately.
  *
- * Example 1: app.addImages{images={{path="/media/data/myImg.png", x=10, y=20, scale=2},
+ * Example 1: local refs = app.addImages{images={{path="/media/data/myImg.png", x=10, y=20, scale=2},
  *                                            {path="/media/data/myImg2.png", maxHeight=300, aspectRatio=true}},
  *                                    allowUndoRedoAction="grouped",
  *                                            }
- * Example 2: app.addImages{images={{data="<binary image data>", x=100, y=200, maxHeight=300, maxWidth=400}}}
+ * Example 2: local refs = app.addImages{images={{data="<binary image data>", x=100, y=200, maxHeight=300,
+ * maxWidth=400}}}
  */
 static int applib_addImages(lua_State* L) {
     Plugin* plugin = Plugin::getPluginFromLua(L);
@@ -2740,19 +2786,23 @@ static int applib_addImages(lua_State* L) {
     lua_settop(L, 1);
 
     luaL_checktype(L, 1, LUA_TTABLE);
+    lua_newtable(L);  // table for return values
 
     lua_getfield(L, 1, "images");
-    if (!lua_istable(L, 2)) {
+    if (!lua_istable(L, -1)) {
         return luaL_error(L, "Missing image table!");
     }
+    // stack now has the following:
+    //    1 = global params table
+    //    2 = table for return value
+    //    3 = images table
 
-    auto cntParams = static_cast<int>(lua_rawlen(L, 2));
+    auto cntParams = static_cast<int>(lua_rawlen(L, -1));
 
     std::vector<Element*> images{};
     for (int imgParam{1}; imgParam <= cntParams; imgParam++) {
-
         lua_pushinteger(L, imgParam);
-        lua_gettable(L, 2);
+        lua_gettable(L, -2);
         luaL_checktype(L, -1, LUA_TTABLE);
 
         lua_getfield(L, -1, "path");
@@ -2766,6 +2816,8 @@ static int applib_addImages(lua_State* L) {
 
         // stack now has the following:
         //    1 = global params table
+        //    2 = table for return value
+        //    3 = images table
         //   -9 = current img-params table
         //   -8 = filepath
         //   -7 = image data
@@ -2812,19 +2864,27 @@ static int applib_addImages(lua_State* L) {
                               "both 'path' parameter and image 'data' were provided. Only one should be specified. ");
         }
 
+        lua_pop(L, 9);  // pop the params we fetched from the global param-table from the stack
+        // stack now has the following:
+        //    1 = global params table
+        //    2 = table for return value
+        //    3 = images table
+
+        lua_pushinteger(L, imgParam);  // index for return table entry
+
         std::unique_ptr<Image> img;
         if (path) {
             fs::path p(path);
             if (p.empty() || !fs::exists(p)) {
-                lua_pop(L, 8);  // pop the params we fetched from the global param-table from the stack
                 lua_pushfstring(L, "Error: file '%s' does not exist.", path);  // soft error
+                lua_settable(L, -4);                                           // insert
                 continue;
             }
 
             img = ImageHandler::createImageFromFile(p);
             if (!img) {
-                lua_pop(L, 8);  // pop the params we fetched from the global param-table from the stack
                 lua_pushfstring(L, "Error: creating the image (%s) failed.", path);  // soft error
+                lua_settable(L, -4);                                                 // insert
                 continue;
             }
         } else {  // data was provided instead
@@ -2879,23 +2939,22 @@ static int applib_addImages(lua_State* L) {
         // store the image to later build the undo/redo action chain
         images.push_back(img.get());
 
-        lua_pop(L, 8);  // pop the params we fetched from the global param-table from the stack
-
+        auto ptr = static_cast<void*>(img.get());
         bool succ = ImageHandler::addImageToDocument(std::move(img), page, control, false);
         if (!succ) {
             lua_pushfstring(L, "Error: Inserting the image (%s) failed.", path);  // soft error
+            lua_settable(L, -4);
         }
-
-        lua_pushnil(L);
+        lua_pushlightuserdata(L, ptr);  // value
+        lua_settable(L, -4);            // insert
     }
-
     // Check how the user wants to handle undoing
     lua_getfield(L, 1, "allowUndoRedoAction");
     const char* allowUndoRedoAction = luaL_optstring(L, -1, "grouped");
-    lua_pop(L, 1);
+    lua_pop(L, 2);
     handleUndoRedoActionHelper(L, control, allowUndoRedoAction, images);
 
-    return cntParams;
+    return 1;
 }
 
 /**
@@ -2904,7 +2963,7 @@ static int applib_addImages(lua_State* L) {
  *
  * @param type string "selection" or "layer"
  * @return {x:number, y:number, width:number, height:number, data:string, format:string, imageWidth:number,
- * imageHeight:number}[] images
+ * imageHeight:number, ref:lightuserdata}[] images
  *
  * Required argument: type ("selection" or "layer")
  *
@@ -2921,6 +2980,7 @@ static int applib_addImages(lua_State* L) {
  *         ["format"] = string,
  *         ["imageWidth"] = integer,
  *         ["imageHeight"] = integer,
+ *         ["ref"] = userdata: 0x5f644c0700d0
  *     },
  *     {
  *         ...
@@ -2982,12 +3042,78 @@ static int applib_getImages(lua_State* L) {
             lua_pushinteger(L, imageSize.second);
             lua_setfield(L, -2, "imageHeight");
 
+            lua_pushlightuserdata(L, static_cast<void*>(im));
+            lua_setfield(L, -2, "ref");
+
             lua_settable(L, -3);  // add image to table
         }
     }
     return 1;
 }
 
+/**
+ * Clears a selection by releasing its elements to the current layer.
+ *
+ * Example: app.clearSelection()
+ *
+ */
+static int applib_clearSelection(lua_State* L) {
+    Plugin* plugin = Plugin::getPluginFromLua(L);
+    Control* control = plugin->getControl();
+    XournalView* xournal = control->getWindow()->getXournal();
+    xournal->clearSelection();
+    return 0;
+}
+
+/**
+ * Adds those elements from the current layer to the current selection,
+ * whose addresses are in refs. If there is no selection create one.
+ *
+ * @param refs lightuserdata[] references to elements from the current layer
+ *
+ * Required argument: refs
+ *
+ * Example: local refs = app.addStrokes( <some stroke data> )
+ *          app.addToSelection(refs)
+ *
+ */
+static int applib_addToSelection(lua_State* L) {
+    Plugin* plugin = Plugin::getPluginFromLua(L);
+    Control* control = plugin->getControl();
+    PageRef page = control->getCurrentPage();
+    XournalView* xournal = control->getWindow()->getXournal();
+    EditSelection* sel = xournal->getSelection();
+    XojPageView* view = xournal->getViewFor(control->getCurrentPageNo());
+
+    std::unordered_set<void*> refs;
+    // stack now contains: -1 => table
+    lua_pushnil(L);
+    // stack now contains: -1 => nil; -2 => table
+    while (lua_next(L, -2)) {
+        // stack now contains: -1 => value; -2 => key; -3 => table
+        void* ref = lua_touserdata(L, -1);
+        refs.emplace(ref);
+        lua_pop(L, 1);
+        // stack now contains: -1 => key; -2 => table
+    }
+    // stack now contains: -1 => table
+    lua_pop(L, 1);  // Stack is now the same as it was on entry to this function
+
+    InsertionOrderRef insertionOrder;
+    insertionOrder.reserve(refs.size());
+    Element::Index n = 0;
+    for (auto&& e: page->getSelectedLayer()->getElements()) {
+        if (refs.count(e.get())) {
+            insertionOrder.emplace_back(e.get(), n++);
+        }
+    }
+
+    auto newSel = sel ? SelectionFactory::addElementsFromActiveLayer(control, sel, insertionOrder) :
+                        SelectionFactory::createFromElementsOnActiveLayer(control, page, view, insertionOrder);
+    xournal->setSelection(newSel.release());
+
+    return 0;
+}
 
 /*
  * The full Lua Plugin API.
@@ -3028,6 +3154,8 @@ static const luaL_Reg applib[] = {{"msgbox", applib_msgbox},  // Todo(gtk4) remo
                                   {"addSplines", applib_addSplines},
                                   {"addImages", applib_addImages},
                                   {"addTexts", applib_addTexts},
+                                  {"addToSelection", applib_addToSelection},
+                                  {"clearSelection", applib_clearSelection},
                                   {"getFilePath", applib_getFilePath},  // Todo(gtk4) remove this deprecated function
                                   {"fileDialogOpen", applib_fileDialogOpen},
                                   {"refreshPage", applib_refreshPage},
